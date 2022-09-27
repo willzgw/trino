@@ -31,12 +31,17 @@ import io.trino.spi.predicate.Domain;
 import io.trino.spi.predicate.NullableValue;
 import io.trino.spi.predicate.TupleDomain;
 import org.apache.hudi.common.model.HoodieFileFormat;
+import org.apache.hudi.common.model.HoodieTableType;
 import org.apache.hudi.common.table.HoodieTableMetaClient;
 
 import java.io.IOException;
 import java.util.List;
 import java.util.Map;
 
+import static io.trino.hive.formats.HiveClassNames.HUDI_INPUT_FORMAT;
+import static io.trino.hive.formats.HiveClassNames.HUDI_PARQUET_INPUT_FORMAT;
+import static io.trino.hive.formats.HiveClassNames.HUDI_PARQUET_REALTIME_INPUT_FORMAT;
+import static io.trino.hive.formats.HiveClassNames.HUDI_REALTIME_INPUT_FORMAT;
 import static io.trino.plugin.hive.HiveErrorCode.HIVE_INVALID_METADATA;
 import static io.trino.plugin.hive.util.HiveUtil.checkCondition;
 import static io.trino.plugin.hudi.HudiErrorCode.HUDI_FILESYSTEM_ERROR;
@@ -45,11 +50,24 @@ import static org.apache.hudi.common.model.HoodieFileFormat.HFILE;
 import static org.apache.hudi.common.model.HoodieFileFormat.HOODIE_LOG;
 import static org.apache.hudi.common.model.HoodieFileFormat.ORC;
 import static org.apache.hudi.common.model.HoodieFileFormat.PARQUET;
+import static org.apache.hudi.common.model.HoodieTableType.COPY_ON_WRITE;
+import static org.apache.hudi.common.model.HoodieTableType.MERGE_ON_READ;
 import static org.apache.hudi.common.table.HoodieTableMetaClient.METAFOLDER_NAME;
 
 public final class HudiUtil
 {
     private HudiUtil() {}
+
+    public static HoodieTableType getHudiTableType(String inputFormat)
+    {
+        return switch (inputFormat) {
+            case HUDI_PARQUET_INPUT_FORMAT,
+                 HUDI_INPUT_FORMAT -> COPY_ON_WRITE;
+            case HUDI_PARQUET_REALTIME_INPUT_FORMAT,
+                 HUDI_REALTIME_INPUT_FORMAT -> MERGE_ON_READ;
+            default -> throw new TrinoException(HUDI_UNSUPPORTED_FILE_FORMAT, "Unsupported hudi table input format: " + inputFormat);
+        };
+    }
 
     public static HoodieFileFormat getHudiFileFormat(String path)
     {

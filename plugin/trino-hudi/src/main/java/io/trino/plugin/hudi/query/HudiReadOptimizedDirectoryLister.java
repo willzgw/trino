@@ -25,6 +25,7 @@ import io.trino.plugin.hudi.HudiTableHandle;
 import io.trino.plugin.hudi.partition.HiveHudiPartitionInfo;
 import io.trino.plugin.hudi.partition.HudiPartitionInfo;
 import org.apache.hudi.common.engine.HoodieLocalEngineContext;
+import org.apache.hudi.common.model.FileSlice;
 import org.apache.hudi.common.model.HoodieBaseFile;
 import org.apache.hudi.common.table.HoodieTableMetaClient;
 import org.apache.hudi.common.table.view.HoodieTableFileSystemView;
@@ -79,17 +80,19 @@ public class HudiReadOptimizedDirectoryLister
     }
 
     @Override
+    public List<FileSlice> listFileSlices(HudiPartitionInfo partitionInfo)
+    {
+        LOG.debug("List partition: partitionInfo=%s", partitionInfo);
+        return fileSystemView.getLatestFileSlices(partitionInfo.getRelativePartitionPath()).toList();
+    }
+
+    @Override
     public List<HudiFileStatus> listStatus(HudiPartitionInfo partitionInfo)
     {
         LOG.debug("List partition: partitionInfo=%s", partitionInfo);
         return fileSystemView.getLatestBaseFiles(partitionInfo.getRelativePartitionPath())
                 .map(HudiReadOptimizedDirectoryLister::getStoragePathInfo)
-                .map(fileEntry -> new HudiFileStatus(
-                        Location.of(fileEntry.getPath().toString()),
-                        false,
-                        fileEntry.getLength(),
-                        fileEntry.getModificationTime(),
-                        max(fileEntry.getBlockSize(), min(fileEntry.getLength(), MIN_BLOCK_SIZE))))
+                .map(HudiReadOptimizedDirectoryLister::getHudiFileStatus)
                 .collect(toImmutableList());
     }
 
@@ -107,11 +110,21 @@ public class HudiReadOptimizedDirectoryLister
         }
     }
 
-    private static StoragePathInfo getStoragePathInfo(HoodieBaseFile baseFile)
+    public static StoragePathInfo getStoragePathInfo(HoodieBaseFile baseFile)
     {
         if (baseFile.getBootstrapBaseFile().isPresent()) {
             return baseFile.getBootstrapBaseFile().get().getPathInfo();
         }
         return baseFile.getPathInfo();
+    }
+
+    public static HudiFileStatus getHudiFileStatus(StoragePathInfo storagePathInfo)
+    {
+        return new HudiFileStatus(
+                Location.of(storagePathInfo.getPath().toString()),
+                storagePathInfo.isDirectory(),
+                storagePathInfo.getLength(),
+                storagePathInfo.getModificationTime(),
+                max(storagePathInfo.getBlockSize(), min(storagePathInfo.getLength(), MIN_BLOCK_SIZE)));
     }
 }

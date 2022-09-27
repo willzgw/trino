@@ -21,20 +21,18 @@ import io.trino.spi.connector.ConnectorSplit;
 import io.trino.spi.predicate.TupleDomain;
 
 import java.util.List;
+import java.util.Optional;
 
 import static com.google.common.base.MoreObjects.toStringHelper;
-import static com.google.common.base.Preconditions.checkArgument;
 import static io.airlift.slice.SizeOf.estimatedSizeOf;
 import static io.airlift.slice.SizeOf.instanceSize;
 import static java.lang.Math.toIntExact;
 import static java.util.Objects.requireNonNull;
 
 public record HudiSplit(
-        String location,
-        long start,
-        long length,
-        long fileSize,
-        long fileModifiedTime,
+        Optional<HudiFileStatus> baseFile,
+        List<HudiFileStatus> logFiles,
+        long commitTime,
         TupleDomain<HiveColumnHandle> predicate,
         List<HivePartitionKey> partitionKeys,
         SplitWeight splitWeight)
@@ -44,11 +42,6 @@ public record HudiSplit(
 
     public HudiSplit
     {
-        checkArgument(start >= 0, "start must be positive");
-        checkArgument(length >= 0, "length must be positive");
-        checkArgument(start + length <= fileSize, "fileSize must be at least start + length");
-
-        requireNonNull(location, "location is null");
         requireNonNull(predicate, "predicate is null");
         partitionKeys = ImmutableList.copyOf(partitionKeys);
         requireNonNull(splitWeight, "splitWeight is null");
@@ -58,7 +51,8 @@ public record HudiSplit(
     public long getRetainedSizeInBytes()
     {
         return INSTANCE_SIZE
-                + estimatedSizeOf(location)
+                + estimatedSizeOf(baseFile.toString())
+                + estimatedSizeOf(logFiles.toString())
                 + splitWeight.getRetainedSizeInBytes()
                 + predicate.getRetainedSizeInBytes(HiveColumnHandle::getRetainedSizeInBytes)
                 + estimatedSizeOf(partitionKeys, HivePartitionKey::estimatedSizeInBytes);
@@ -68,11 +62,9 @@ public record HudiSplit(
     public String toString()
     {
         return toStringHelper(this)
-                .addValue(location)
-                .addValue(start)
-                .addValue(length)
-                .addValue(fileSize)
-                .addValue(fileModifiedTime)
+                .addValue(baseFile)
+                .addValue(logFiles)
+                .addValue(commitTime)
                 .toString();
     }
 }

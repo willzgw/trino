@@ -15,7 +15,6 @@ package io.trino.plugin.hudi;
 
 import com.google.common.collect.ImmutableList;
 import com.google.inject.Inject;
-import io.trino.filesystem.Location;
 import io.trino.filesystem.TrinoFileSystem;
 import io.trino.filesystem.TrinoFileSystemFactory;
 import io.trino.filesystem.TrinoInputFile;
@@ -91,6 +90,7 @@ import static io.trino.plugin.hudi.HudiErrorCode.HUDI_BAD_DATA;
 import static io.trino.plugin.hudi.HudiErrorCode.HUDI_CANNOT_OPEN_SPLIT;
 import static io.trino.plugin.hudi.HudiErrorCode.HUDI_CURSOR_ERROR;
 import static io.trino.plugin.hudi.HudiErrorCode.HUDI_INVALID_PARTITION_VALUE;
+import static io.trino.plugin.hudi.HudiErrorCode.HUDI_UNKNOWN_TABLE_TYPE;
 import static io.trino.plugin.hudi.HudiErrorCode.HUDI_UNSUPPORTED_FILE_FORMAT;
 import static io.trino.plugin.hudi.HudiSessionProperties.getParquetMaxReadBlockRowCount;
 import static io.trino.plugin.hudi.HudiSessionProperties.getParquetSmallFileThreshold;
@@ -122,6 +122,8 @@ import static java.util.Objects.requireNonNull;
 import static java.util.stream.Collectors.toList;
 import static java.util.stream.Collectors.toMap;
 import static org.apache.hudi.common.model.HoodieFileFormat.PARQUET;
+import static org.apache.hudi.common.model.HoodieTableType.COPY_ON_WRITE;
+import static org.apache.hudi.common.model.HoodieTableType.MERGE_ON_READ;
 
 public class HudiPageSourceProvider
         implements ConnectorPageSourceProvider
@@ -154,82 +156,92 @@ public class HudiPageSourceProvider
             DynamicFilter dynamicFilter)
     {
         HudiSplit split = (HudiSplit) connectorSplit;
-        String path = split.location();
-        HoodieFileFormat hudiFileFormat = getHudiFileFormat(path);
-        if (PARQUET != hudiFileFormat) {
-            throw new TrinoException(HUDI_UNSUPPORTED_FILE_FORMAT, format("File format %s not supported", hudiFileFormat));
+        HudiTableHandle tableHandle = (HudiTableHandle) connectorTable;
+
+        if (tableHandle.getTableType().equals(COPY_ON_WRITE)) {
+            HudiFileStatus baseFile = split.baseFile().orElseThrow(() -> new TrinoException(HUDI_CANNOT_OPEN_SPLIT, "Split without base file is invalid"));
+            String path = baseFile.location().toString();
+            HoodieFileFormat hudiFileFormat = getHudiFileFormat(path);
+            if (PARQUET != hudiFileFormat) {
+                throw new TrinoException(HUDI_UNSUPPORTED_FILE_FORMAT, format("File format %s not supported", hudiFileFormat));
+            }
+
+            List<HiveColumnHandle> hiveColumns = columns.stream()
+                    .map(HiveColumnHandle.class::cast)
+                    .collect(toList());
+            // just send regular columns to create parquet page source
+            // for partition columns, separate blocks will be created
+            List<HiveColumnHandle> regularColumns = hiveColumns.stream()
+                    .filter(columnHandle -> !columnHandle.isPartitionKey() && !columnHandle.isHidden())
+                    .collect(toList());
+            ConnectorPageSource pageSource = createPageSource(
+                    session,
+                    regularColumns,
+                    baseFile,
+                    split.predicate(),
+                    dataSourceStats,
+                    ParquetReaderOptions.builder(options)
+                            .withSmallFileThreshold(getParquetSmallFileThreshold(session))
+                            .withVectorizedDecodingEnabled(isParquetVectorizedDecodingEnabled(session))
+                            .withMaxReadBlockRowCount(getParquetMaxReadBlockRowCount(session))
+                            .build(),
+                    timeZone);
+
+            Map<String, Block> partitionBlocks = convertPartitionValues(hiveColumns, split.partitionKeys());
+
+            TransformConnectorPageSource.Builder transforms = TransformConnectorPageSource.builder();
+            int delegateIndex = 0;
+            for (HiveColumnHandle column : hiveColumns) {
+                if (partitionBlocks.containsKey(column.getName())) {
+                    transforms.constantValue(partitionBlocks.get(column.getName()));
+                }
+                else if (column.getName().equals(PARTITION_COLUMN_NAME)) {
+                    transforms.constantValue(nativeValueToBlock(PARTITION_TYPE_SIGNATURE, utf8Slice(toPartitionName(split.partitionKeys()))));
+                }
+                else if (column.getName().equals(PATH_COLUMN_NAME)) {
+                    transforms.constantValue(nativeValueToBlock(PATH_TYPE, utf8Slice(path)));
+                }
+                else if (column.getName().equals(FILE_SIZE_COLUMN_NAME)) {
+                    transforms.constantValue(nativeValueToBlock(FILE_SIZE_TYPE_SIGNATURE, baseFile.length()));
+                }
+                else if (column.getName().equals(FILE_MODIFIED_TIME_COLUMN_NAME)) {
+                    long packedTimestamp = packDateTimeWithZone(split.commitTime(), UTC_KEY);
+                    transforms.constantValue(nativeValueToBlock(FILE_MODIFIED_TIME_TYPE_SIGNATURE, packedTimestamp));
+                }
+                else {
+                    transforms.column(delegateIndex);
+                    delegateIndex++;
+                }
+            }
+
+            return transforms.build(pageSource);
         }
-
-        List<HiveColumnHandle> hiveColumns = columns.stream()
-                .map(HiveColumnHandle.class::cast)
-                .collect(toList());
-        // just send regular columns to create parquet page source
-        // for partition columns, separate blocks will be created
-        List<HiveColumnHandle> regularColumns = hiveColumns.stream()
-                .filter(columnHandle -> !columnHandle.isPartitionKey() && !columnHandle.isHidden())
-                .collect(toList());
-        TrinoFileSystem fileSystem = fileSystemFactory.create(session);
-        TrinoInputFile inputFile = fileSystem.newInputFile(Location.of(path), split.fileSize());
-        ConnectorPageSource pageSource = createPageSource(
-                session,
-                regularColumns,
-                split,
-                inputFile,
-                dataSourceStats,
-                ParquetReaderOptions.builder(options)
-                        .withSmallFileThreshold(getParquetSmallFileThreshold(session))
-                        .withVectorizedDecodingEnabled(isParquetVectorizedDecodingEnabled(session))
-                        .withMaxReadBlockRowCount(getParquetMaxReadBlockRowCount(session))
-                        .build(),
-                timeZone);
-
-        Map<String, Block> partitionBlocks = convertPartitionValues(hiveColumns, split.partitionKeys());
-
-        TransformConnectorPageSource.Builder transforms = TransformConnectorPageSource.builder();
-        int delegateIndex = 0;
-        for (HiveColumnHandle column : hiveColumns) {
-            if (partitionBlocks.containsKey(column.getName())) {
-                transforms.constantValue(partitionBlocks.get(column.getName()));
-            }
-            else if (column.getName().equals(PARTITION_COLUMN_NAME)) {
-                transforms.constantValue(nativeValueToBlock(PARTITION_TYPE_SIGNATURE, utf8Slice(toPartitionName(split.partitionKeys()))));
-            }
-            else if (column.getName().equals(PATH_COLUMN_NAME)) {
-                transforms.constantValue(nativeValueToBlock(PATH_TYPE, utf8Slice(path)));
-            }
-            else if (column.getName().equals(FILE_SIZE_COLUMN_NAME)) {
-                transforms.constantValue(nativeValueToBlock(FILE_SIZE_TYPE_SIGNATURE, split.fileSize()));
-            }
-            else if (column.getName().equals(FILE_MODIFIED_TIME_COLUMN_NAME)) {
-                long packedTimestamp = packDateTimeWithZone(split.fileModifiedTime(), UTC_KEY);
-                transforms.constantValue(nativeValueToBlock(FILE_MODIFIED_TIME_TYPE_SIGNATURE, packedTimestamp));
-            }
-            else {
-                transforms.column(delegateIndex);
-                delegateIndex++;
-            }
+        else if (tableHandle.getTableType().equals(MERGE_ON_READ)) {
+            return null;  // TODO: implement page source for MOR
         }
-
-        return transforms.build(pageSource);
+        else {
+            throw new TrinoException(HUDI_UNKNOWN_TABLE_TYPE, format("Could not create page source for table type: %s", tableHandle.getTableType()));
+        }
     }
 
-    private static ConnectorPageSource createPageSource(
+    private ConnectorPageSource createPageSource(
             ConnectorSession session,
             List<HiveColumnHandle> columns,
-            HudiSplit hudiSplit,
-            TrinoInputFile inputFile,
+            HudiFileStatus baseFile,
+            TupleDomain<HiveColumnHandle> predicate,
             FileFormatDataSourceStats dataSourceStats,
             ParquetReaderOptions options,
             DateTimeZone timeZone)
     {
         ParquetDataSource dataSource = null;
         boolean useColumnNames = shouldUseParquetColumnNames(session);
-        String path = hudiSplit.location();
-        long start = hudiSplit.start();
-        long length = hudiSplit.length();
+        String path = baseFile.location().toString();
+        long length = baseFile.length();
+        TrinoFileSystem fileSystem = fileSystemFactory.create(session);
+        TrinoInputFile inputFile = fileSystem.newInputFile(baseFile.location(), baseFile.length());
         try {
             AggregatedMemoryContext memoryContext = newSimpleAggregatedMemoryContext();
-            dataSource = createDataSource(inputFile, OptionalLong.of(hudiSplit.fileSize()), options, memoryContext, dataSourceStats);
+            dataSource = createDataSource(inputFile, OptionalLong.of(length), options, memoryContext, dataSourceStats);
             ParquetMetadata parquetMetadata = MetadataReader.readFooter(dataSource, options.getMaxFooterReadSize());
             FileMetadata fileMetaData = parquetMetadata.getFileMetaData();
             MessageType fileSchema = fileMetaData.getSchema();
@@ -242,12 +254,12 @@ public class HudiPageSourceProvider
             Map<List<String>, ColumnDescriptor> descriptorsByPath = getDescriptors(fileSchema, requestedSchema);
             TupleDomain<ColumnDescriptor> parquetTupleDomain = options.isIgnoreStatistics()
                     ? TupleDomain.all()
-                    : getParquetTupleDomain(descriptorsByPath, hudiSplit.predicate(), fileSchema, useColumnNames);
+                    : getParquetTupleDomain(descriptorsByPath, predicate, fileSchema, useColumnNames);
 
             TupleDomainParquetPredicate parquetPredicate = buildPredicate(requestedSchema, parquetTupleDomain, descriptorsByPath, timeZone);
 
             List<RowGroupInfo> rowGroups = getFilteredRowGroups(
-                    start,
+                    0,
                     length,
                     dataSource,
                     parquetMetadata,
@@ -288,7 +300,7 @@ public class HudiPageSourceProvider
             if (e instanceof ParquetCorruptionException) {
                 throw new TrinoException(HUDI_BAD_DATA, e);
             }
-            String message = "Error opening Hudi split %s (offset=%s, length=%s): %s".formatted(path, start, length, e.getMessage());
+            String message = "Error opening Hudi split %s (offset=%s, length=%s): %s".formatted(path, 0, length, e.getMessage());
             throw new TrinoException(HUDI_CANNOT_OPEN_SPLIT, message, e);
         }
     }

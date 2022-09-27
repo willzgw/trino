@@ -13,23 +13,25 @@
  */
 package io.trino.plugin.hudi.split;
 
-import com.google.common.collect.ImmutableList;
 import io.trino.plugin.hive.HivePartitionKey;
 import io.trino.plugin.hudi.HudiFileStatus;
 import io.trino.plugin.hudi.HudiSplit;
 import io.trino.plugin.hudi.HudiTableHandle;
+import io.trino.plugin.hudi.query.HudiReadOptimizedDirectoryLister;
 import io.trino.spi.TrinoException;
+import org.apache.hudi.common.model.FileSlice;
+import org.apache.hudi.common.model.HoodieLogFile;
 
 import java.util.List;
+import java.util.Optional;
 
+import static com.google.common.collect.ImmutableList.toImmutableList;
 import static io.trino.plugin.hudi.HudiErrorCode.HUDI_FILESYSTEM_ERROR;
 import static java.lang.String.format;
 import static java.util.Objects.requireNonNull;
 
 public class HudiSplitFactory
 {
-    private static final double SPLIT_SLOP = 1.1;   // 10% slop/overflow allowed in bytes per split while generating splits
-
     private final HudiTableHandle hudiTableHandle;
     private final HudiSplitWeightProvider hudiSplitWeightProvider;
 
@@ -41,53 +43,37 @@ public class HudiSplitFactory
         this.hudiSplitWeightProvider = requireNonNull(hudiSplitWeightProvider, "hudiSplitWeightProvider is null");
     }
 
-    public List<HudiSplit> createSplits(List<HivePartitionKey> partitionKeys, HudiFileStatus fileStatus)
+    public Optional<HudiSplit> createSplit(List<HivePartitionKey> partitionKeys, FileSlice fileSlice)
     {
-        if (fileStatus.isDirectory()) {
-            throw new TrinoException(HUDI_FILESYSTEM_ERROR, format("Not a valid location: %s", fileStatus.location()));
+        Optional<HudiFileStatus> baseFile = Optional.ofNullable(fileSlice.getBaseFile()
+                .map(HudiReadOptimizedDirectoryLister::getStoragePathInfo)
+                .map(HudiReadOptimizedDirectoryLister::getHudiFileStatus)
+                .orElse(null));
+
+        List<HoodieLogFile> hoodieLogFiles = fileSlice.getLogFiles().collect(toImmutableList());
+
+        if (baseFile.isEmpty() && hoodieLogFiles.isEmpty()) {
+            return Optional.empty();
         }
 
-        long fileSize = fileStatus.length();
-
-        if (fileSize == 0) {
-            return ImmutableList.of(new HudiSplit(
-                    fileStatus.location().toString(),
-                    0,
-                    fileSize,
-                    fileSize,
-                    fileStatus.modificationTime(),
-                    hudiTableHandle.getRegularPredicates(),
-                    partitionKeys,
-                    hudiSplitWeightProvider.calculateSplitWeight(fileSize)));
+        if (baseFile.isPresent() && baseFile.get().isDirectory()) {
+            throw new TrinoException(HUDI_FILESYSTEM_ERROR, format("Not a valid location: %s", baseFile.get().location()));
         }
 
-        ImmutableList.Builder<HudiSplit> splits = ImmutableList.builder();
-        long splitSize = fileStatus.blockSize();
+        List<HudiFileStatus> logFiles = hoodieLogFiles.stream()
+                .map(HoodieLogFile::getPathInfo)
+                .map(HudiReadOptimizedDirectoryLister::getHudiFileStatus)
+                .collect(toImmutableList());
 
-        long bytesRemaining = fileSize;
-        while (((double) bytesRemaining) / splitSize > SPLIT_SLOP) {
-            splits.add(new HudiSplit(
-                    fileStatus.location().toString(),
-                    fileSize - bytesRemaining,
-                    splitSize,
-                    fileSize,
-                    fileStatus.modificationTime(),
-                    hudiTableHandle.getRegularPredicates(),
-                    partitionKeys,
-                    hudiSplitWeightProvider.calculateSplitWeight(splitSize)));
-            bytesRemaining -= splitSize;
-        }
-        if (bytesRemaining > 0) {
-            splits.add(new HudiSplit(
-                    fileStatus.location().toString(),
-                    fileSize - bytesRemaining,
-                    bytesRemaining,
-                    fileSize,
-                    fileStatus.modificationTime(),
-                    hudiTableHandle.getRegularPredicates(),
-                    partitionKeys,
-                    hudiSplitWeightProvider.calculateSplitWeight(bytesRemaining)));
-        }
-        return splits.build();
+        long logFilesSize = !hoodieLogFiles.isEmpty() ? hoodieLogFiles.stream().map(HoodieLogFile::getFileSize).reduce(0L, Long::sum) : 0L;
+        long fileSize = fileSlice.getBaseFile().map(hoodieBaseFile -> hoodieBaseFile.getFileLen() + logFilesSize).orElse(logFilesSize);
+
+        return Optional.of(new HudiSplit(
+                baseFile,
+                logFiles,
+                baseFile.map(HudiFileStatus::modificationTime).orElse(logFiles.getFirst().modificationTime()),
+                hudiTableHandle.getRegularPredicates(),
+                partitionKeys,
+                hudiSplitWeightProvider.calculateSplitWeight(fileSize)));
     }
 }

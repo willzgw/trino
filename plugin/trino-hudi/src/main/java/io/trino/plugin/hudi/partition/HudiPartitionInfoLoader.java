@@ -16,7 +16,6 @@ package io.trino.plugin.hudi.partition;
 import io.airlift.concurrent.MoreFutures;
 import io.trino.plugin.hive.HivePartitionKey;
 import io.trino.plugin.hive.util.AsyncQueue;
-import io.trino.plugin.hudi.HudiFileStatus;
 import io.trino.plugin.hudi.query.HudiDirectoryLister;
 import io.trino.plugin.hudi.split.HudiSplitFactory;
 import io.trino.spi.connector.ConnectorSplit;
@@ -68,10 +67,10 @@ public class HudiPartitionInfoLoader
         partitionInfo.ifPresent(hudiPartitionInfo -> {
             if (hudiPartitionInfo.doesMatchPredicates() || partitionName.equals(NON_PARTITION)) {
                 List<HivePartitionKey> partitionKeys = hudiPartitionInfo.getHivePartitionKeys();
-                List<HudiFileStatus> partitionFiles = hudiDirectoryLister.listStatus(hudiPartitionInfo);
-                partitionFiles.stream()
-                        .flatMap(fileStatus -> hudiSplitFactory.createSplits(partitionKeys, fileStatus).stream())
-                        .map(asyncQueue::offer)
+                hudiDirectoryLister.listFileSlices(hudiPartitionInfo).stream()
+                        .map(fileSlice -> hudiSplitFactory.createSplit(partitionKeys, fileSlice))
+                        .filter(Optional::isPresent)
+                        .map(split -> asyncQueue.offer(split.get()))
                         .forEachOrdered(MoreFutures::getFutureValue);
             }
         });
