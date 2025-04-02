@@ -277,7 +277,7 @@ public abstract class DefaultTraversalVisitor<C>
     @Override
     protected Void visitWindowDefinition(WindowDefinition node, C context)
     {
-        process(node.getWindow());
+        process(node.getWindow(), context);
 
         return null;
     }
